@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bike Fuel Manager</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom font family */
+        :root { font-family: 'Inter', sans-serif; }
+        
+        /* Custom CSS for Notification */
+        @keyframes slideIn {
+            0% { transform: translateY(100%); opacity: 0; }
+            10% { transform: translateY(0); opacity: 1; }
+            90% { transform: translateY(0); opacity: 1; }
+            100% { transform: translateY(100%); opacity: 0; }
+        }
+        .notification.active {
+            animation: slideIn 6s ease-in-out forwards;
+        }
+        
+        /* Fuel Gauge Color Transitions */
+        .fuel-gauge { transition: width 0.5s ease; }
+
+        /* Hide tabs by default */
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Modal backdrop effect */
+        .modal-overlay {
+            background-color: rgba(0, 0, 0, 0.7);
+            z-index: 50;
+        }
+        
+        /* Haversine distance function (simplified for direct distance calculation) */
+        /* This function is required for the live AFE calculation */
+        /* R is the radius of the Earth in km */
+        .haversine { display: none; }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen text-gray-800">
+
+    <!-- Global State Variables (Hidden) -->
+    <script>
+        // --- CORE GLOBAL CONFIGURATION ---
+        const BLE_DEVICE_NAME = "BikeFuelMonitor";
+        const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+        const CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+        
+        // Bike Presets (Model-Based Calibration Data)
+        const BIKE_PRESETS = {
+            'PULSAR150': { name: 'Bajaj Pulsar 150', capacity: 15.0, v_max: 3500, v_min: 1050, afg: 45.0 },
+            'SPLENDOR': { name: 'Hero Splendor Plus', capacity: 10.0, v_max: 3700, v_min: 950, afg: 65.0 },
+            'RECLASSIC': { name: 'Royal Enfield Classic', capacity: 13.5, v_max: 3400, v_min: 1100, afg: 35.0 },
+            'CUSTOM': { name: 'Custom Bike (Linear)', capacity: 12.0, v_max: 3600, v_min: 1000, afg: 50.0 },
+            'PROJECT': { name: 'Project/Study Mode', capacity: 12.0, v_max: 3650, v_min: 950, afg: 50.0 }
+        };
+
+        let currentConfig = {
+            modelId: null,
+            name: 'Disconnected',
+            capacity: 0,
+            v_max: 0, 
+            v_min: 0,
+            initialAFE: 50.0, // Initial Estimated Average Fuel Economy (AFE)
+            initialFuel: 0.0,
+            lastFuel: 0.0,
+            rawADC: 0,
+            crossSectionArea: 0.0, // For project mode
+            trackingStartTime: Date.now(),
+            startLat: null,
+            startLon: null,
+            totalDistance: 0.0,
+            totalFuelUsed: 0.0,
+            liveAFE: 0.0,
+            lastGPSLat: null,
+            lastGPSLon: null,
+            lastFuelLiters: null,
+            lastAfeUpdate: Date.now(),
+            lastDteNotification: 11, // To control staged notifications (starts above max)
+            bleDevice: null,
+            bleServer: null,
+            rawCharacteristic: null,
+            gpsWatcherId: null,
+            afgIntervalId: null
+        };
+        
+        // --- Utility Functions ---
+
+        const R = 6371; // Radius of Earth in km
+        function toRad(value) { return value * Math.PI / 180; }
+
+        function haversineDistance(lat1, lon1, lat2, lon2) {
+            if (!lat1 || !lon1 || !lat2 || !lon2) return 0;
+            const dLat = toRad(lat2 - lat1);
+            const dLon = toRad(lon2 - lon1);
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c; // Distance in km
+        }
+
+        function calculateLiters(rawValue) {
+            if (!currentConfig.capacity || !currentConfig.v_max || !currentConfig.v_min) return 0;
+
+            const Vmax = currentConfig.v_max;
+            const Vmin = currentConfig.v_min;
+            const Capacity = currentConfig.capacity;
+
+            // Linear Interpolation: Liters = Capacity * (Vmax - Vraw) / (Vmax - Vmin)
+            let liters = Capacity * ((Vmax - rawValue) / (Vmax - Vmin));
+            
+            // Clamp value between 0 and capacity
+            liters = Math.min(Math.max(liters, 0), Capacity);
+            
+            return parseFloat(liters.toFixed(2));
+        }
+
+        function showNotification(message) {
+            const el = document.getElementById('notification-alert');
+            el.querySelector('#notification-message').textContent = message;
+            el.classList.add('active');
+            el.classList.remove('hidden');
+
+            setTimeout(() => {
+                el.classList.remove('active');
+                setTimeout(() => el.classList.add('hidden'), 500); // Wait for animation to finish
+            }, 5500);
+        }
+
+        function checkLowFuelNotification(currentLiters, dte) {
+            // Low fuel threshold is 2.0 Liters
+            const lowFuelThreshold = 2.0; 
+            const dteThresholds = [10, 6, 4, 2, 1];
+
+            if (currentLiters <= lowFuelThreshold) {
+                // Check if we passed a notification threshold (e.g., DTE drops from 11km to 9km)
+                for (const km of dteThresholds) {
+                    if (dte <= km && currentConfig.lastDteNotification > km) {
+                        showNotification(`⚠ LOW FUEL! DTE: ${dte.toFixed(0)} km.`);
+                        currentConfig.lastDteNotification = km;
+                        break;
+                    }
+                }
+            } else if (currentLiters > lowFuelThreshold && currentConfig.lastDteNotification <= 10) {
+                 // Reset notification flag when fuel goes above threshold
+                currentConfig.lastDteNotification = 11;
+            }
+        }
+        
+        function getFuelGaugeColor(percent) {
+            if (percent > 30) return 'bg-green-500';
+            if (percent > 15) return 'bg-yellow-500';
+            return 'bg-red-500';
+        }
+
+        // --- Persistence and Configuration ---
+        function loadConfig() {
+            const savedConfig = localStorage.getItem('fuelConfig');
+            if (savedConfig) {
+                currentConfig = JSON.parse(savedConfig);
+                document.getElementById('bike-select').value = currentConfig.modelId;
+                updateSettingsForm(currentConfig.modelId);
+                // Load trip stats
+                document.getElementById('total-distance').textContent = currentConfig.totalDistance.toFixed(2);
+                document.getElementById('total-fuel-used').textContent = currentConfig.totalFuelUsed.toFixed(2);
+                document.getElementById('live-afe').textContent = currentConfig.liveAFE.toFixed(1);
+            }
+            // If no model ID is set, force settings modal open
+            if (!currentConfig.modelId) {
+                document.getElementById('settings-modal').classList.remove('hidden');
+                document.getElementById('bike-name').textContent = "Setup Required";
+            } else {
+                document.getElementById('bike-name').textContent = currentConfig.name;
+            }
+        }
+
+        function saveConfig() {
+            localStorage.setItem('fuelConfig', JSON.stringify(currentConfig));
+            console.log("Configuration saved:", currentConfig);
+        }
+
+        function updateSettingsForm(modelId) {
+            const preset = BIKE_PRESETS[modelId];
+            const isCustom = (modelId === 'CUSTOM' || modelId === 'PROJECT');
+            
+            // Set capacity and AFE defaults
+            document.getElementById('capacity-input').value = currentConfig.capacity || preset.capacity;
+            document.getElementById('afe-input').value = currentConfig.initialAFE || preset.afg;
+            
+            // Set Vmax/Vmin defaults
+            document.getElementById('vmax-input').value = currentConfig.v_max || preset.v_max;
+            document.getElementById('vmin-input').value = currentConfig.v_min || preset.v_min;
+
+            // Show/Hide Custom fields
+            document.getElementById('custom-fields').classList.toggle('hidden', !isCustom);
+            
+            // Update UI name
+            document.getElementById('bike-name').textContent = preset.name;
+        }
+
+        function handleModelChange() {
+            const modelId = document.getElementById('bike-select').value;
+            const preset = BIKE_PRESETS[modelId];
+            
+            // Update currentConfig with preset values (overwriting custom if needed)
+            currentConfig.modelId = modelId;
+            currentConfig.name = preset.name;
+            currentConfig.capacity = preset.capacity;
+            currentConfig.initialAFE = preset.afg;
+            currentConfig.v_max = preset.v_max;
+            currentConfig.v_min = preset.v_min;
+            
+            updateSettingsForm(modelId);
+        }
+
+        function saveAndApplyCalibration() {
+            const modelId = document.getElementById('bike-select').value;
+            currentConfig.modelId = modelId;
+            currentConfig.name = BIKE_PRESETS[modelId].name;
+            currentConfig.capacity = parseFloat(document.getElementById('capacity-input').value);
+            currentConfig.initialAFE = parseFloat(document.getElementById('afe-input').value);
+            currentConfig.v_max = parseInt(document.getElementById('vmax-input').value);
+            currentConfig.v_min = parseInt(document.getElementById('vmin-input').value);
+
+            // Hide modal and save
+            document.getElementById('settings-modal').classList.add('hidden');
+            saveConfig();
+            updateDashboardStatus(); // Update status checks
+        }
+
+        // --- Live AFE Tracking Logic ---
+
+        // Called on 60 second interval to update AFE
+        function updateAFE() {
+            // Check essential data points
+            if (!currentConfig.lastGPSLat || !currentConfig.lastFuelLiters) {
+                console.warn("AFE: Waiting for initial fuel or GPS data.");
+                document.getElementById('afg-status').textContent = 'Searching...';
+                return;
+            }
+
+            // 1. Calculate Distance Traveled (simulated continuous tracking)
+            navigator.geolocation.getCurrentPosition(position => {
+                const currentLat = position.coords.latitude;
+                const currentLon = position.coords.longitude;
+                
+                // Distance since last check (simulated incremental distance)
+                const distanceDelta = haversineDistance(
+                    currentConfig.lastGPSLat, currentConfig.lastGPSLon,
+                    currentLat, currentLon
+                );
+                
+                // 2. Calculate Fuel Used (delta)
+                const fuelDelta = currentConfig.lastFuelLiters - calculateLiters(currentConfig.rawADC);
+
+                // Ensure enough distance/fuel change occurred for a valid reading
+                if (distanceDelta > 0.01 && fuelDelta > 0.001) {
+                    const instantaneousAFE = distanceDelta / fuelDelta;
+                    
+                    // Simple running average smoothing (90% old average, 10% new reading)
+                    if (currentConfig.liveAFE === 0) {
+                        currentConfig.liveAFE = instantaneousAFE;
+                    } else {
+                        currentConfig.liveAFE = currentConfig.liveAFE * 0.9 + instantaneousAFE * 0.1;
+                    }
+
+                    document.getElementById('afg-status').textContent = 'Tracking Live';
+                    document.getElementById('live-afe').textContent = currentConfig.liveAFE.toFixed(1);
+                    saveConfig();
+
+                } else {
+                    document.getElementById('afg-status').textContent = 'AFE Stable/Idle';
+                }
+
+                // Update 'last' tracking points for next interval
+                currentConfig.lastGPSLat = currentLat;
+                currentConfig.lastGPSLon = currentLon;
+                currentConfig.lastFuelLiters = calculateLiters(currentConfig.rawADC);
+            }, 
+            (error) => {
+                document.getElementById('afg-status').textContent = `GPS Error (${error.code})`;
+                console.error("GPS Error:", error);
+            });
+        }
+        
+        function resetTripTracking() {
+            currentConfig.totalDistance = 0.0;
+            currentConfig.totalFuelUsed = 0.0;
+            currentConfig.liveAFE = currentConfig.initialAFE; // Reset to saved default
+            currentConfig.lastDteNotification = 11;
+
+            // Reset GPS start point to current location
+            navigator.geolocation.getCurrentPosition(position => {
+                currentConfig.startLat = position.coords.latitude;
+                currentConfig.startLon = position.coords.longitude;
+                currentConfig.lastGPSLat = position.coords.latitude;
+                currentConfig.lastGPSLon = position.coords.longitude;
+            });
+
+            // Set initial fuel for consumption tracking
+            currentConfig.initialFuel = calculateLiters(currentConfig.rawADC);
+            currentConfig.lastFuelLiters = currentConfig.initialFuel;
+            
+            document.getElementById('afg-status').textContent = 'Trip Reset';
+            document.getElementById('total-distance').textContent = '0.00';
+            document.getElementById('total-fuel-used').textContent = '0.00';
+            document.getElementById('live-afe').textContent = currentConfig.liveAFE.toFixed(1);
+            
+            saveConfig();
+        }
+
+        // --- UI & Status Handlers ---
+
+        function updateDashboardStatus() {
+            // Check 1: Model Selected
+            const modelStatus = !!currentConfig.modelId;
+            document.getElementById('status-setup').classList.toggle('bg-green-500', modelStatus);
+            document.getElementById('status-setup').classList.toggle('bg-red-500', !modelStatus);
+
+            // Check 2: BLE Status (handled by connection handler)
+            const bleStatus = currentConfig.bleDevice && currentConfig.bleDevice.gatt.connected;
+            document.getElementById('status-ble').classList.toggle('bg-green-500', bleStatus);
+            document.getElementById('status-ble').classList.toggle('bg-red-500', !bleStatus);
+            document.getElementById('connect-btn').textContent = bleStatus ? "BLE Connected" : "Connect BLE Device";
+            document.getElementById('connect-btn').disabled = bleStatus;
+            
+            // Check 3: GPS Status (handled by location watcher)
+            // (We assume GPS is running if tracking is initialized)
+            document.getElementById('status-gps').classList.toggle('bg-green-500', !!currentConfig.gpsWatcherId);
+            document.getElementById('status-gps').classList.toggle('bg-red-500', !currentConfig.gpsWatcherId);
+            
+            // Show / Hide Dashboard content based on readiness
+            const isReady = modelStatus && bleStatus && !!currentConfig.gpsWatcherId;
+            document.getElementById('full-dashboard-content').classList.toggle('opacity-30', !isReady);
+            document.getElementById('full-dashboard-content').classList.toggle('pointer-events-none', !isReady);
+        }
+
+        function updateLiveDashboard(rawValue) {
+            currentConfig.rawADC = rawValue;
+            const liters = calculateLiters(rawValue);
+            const percent = (liters / currentConfig.capacity) * 100;
+            const dte = liters * currentConfig.liveAFE;
+
+            // Update DOM
+            document.getElementById('fuel-liters').textContent = liters.toFixed(2);
+            document.getElementById('fuel-percent').textContent = percent.toFixed(1);
+            document.getElementById('dte-km').textContent = dte.toFixed(0);
+            
+            // Update Fuel Gauge
+            const gauge = document.getElementById('fuel-gauge');
+            gauge.style.width = `${Math.min(percent, 100)}%`;
+            gauge.className = `fuel-gauge h-full rounded-full ${getFuelGaugeColor(percent)}`;
+
+            // Update Fuel Efficiency Tip
+            const tipEl = document.getElementById('mileage-tip');
+            if (currentConfig.liveAFE > BIKE_PRESETS[currentConfig.modelId].afg + 5) {
+                tipEl.textContent = "Efficiency is excellent! Keep up the smooth riding.";
+            } else if (currentConfig.liveAFE < BIKE_PRESETS[currentConfig.modelId].afg - 5) {
+                tipEl.textContent = "AFE is low. Try steady throttle below 60 km/h for better mileage.";
+            } else {
+                tipEl.textContent = "Normal efficiency maintained.";
+            }
+
+            // Check Notifications
+            checkLowFuelNotification(liters, dte);
+        }
+        
+        // --- Geolocation Functions ---
+        function startGPSWatcher() {
+            if (currentConfig.gpsWatcherId) return; // Already running
+
+            if (!navigator.geolocation) {
+                alert("Geolocation is not supported by your browser. Cannot calculate DTE.");
+                return;
+            }
+
+            const geoSuccess = (position) => {
+                console.log("GPS Position received.");
+                // Set initial tracking points if not set (first run)
+                if (!currentConfig.startLat) {
+                    currentConfig.startLat = position.coords.latitude;
+                    currentConfig.startLon = position.coords.longitude;
+                    currentConfig.lastGPSLat = position.coords.latitude;
+                    currentConfig.lastGPSLon = position.coords.longitude;
+                    currentConfig.initialFuel = calculateLiters(currentConfig.rawADC);
+                    currentConfig.lastFuelLiters = currentConfig.initialFuel;
+                    currentConfig.liveAFE = currentConfig.initialAFE; // Use saved estimate initially
+                    saveConfig();
+                }
+                document.getElementById('afg-status').textContent = 'Tracking Live';
+                updateDashboardStatus();
+            };
+
+            const geoError = (error) => {
+                document.getElementById('afg-status').textContent = 'GPS Disabled/Error';
+                console.error("GPS Error:", error);
+                updateDashboardStatus();
+            };
+            
+            // Start watching position for continuous updates (every 10 seconds, high accuracy)
+            currentConfig.gpsWatcherId = navigator.geolocation.watchPosition(geoSuccess, geoError, {
+                enableHighAccuracy: true,
+                timeout: 5000,
+                maximumAge: 0
+            });
+            
+            // Start AFE calculation interval (60 seconds)
+            currentConfig.afgIntervalId = setInterval(updateAFE, 60000); 
+        }
+
+        // --- Web Bluetooth Implementation ---
+
+        async function connectBLE() {
+            if (!currentConfig.modelId) {
+                alert("Please select a bike model in Settings first!");
+                document.getElementById('settings-modal').classList.remove('hidden');
+                return;
+            }
+
+            try {
+                // Request the device
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ name: BLE_DEVICE_NAME }],
+                    optionalServices: [SERVICE_UUID]
+                });
+
+                currentConfig.bleDevice = device;
+                document.getElementById('connect-btn').textContent = "Connecting...";
+
+                // Connect to the GATT server
+                const server = await device.gatt.connect();
+                currentConfig.bleServer = server;
+                
+                // Get the service
+                const service = await server.getPrimaryService(SERVICE_UUID);
+                
+                // Get the characteristic (the raw data container)
+                const characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+                currentConfig.rawCharacteristic = characteristic;
+
+                // Start receiving notifications (live updates)
+                await characteristic.startNotifications();
+                characteristic.addEventListener('characteristicvaluechanged', handleNotifications);
+
+                updateDashboardStatus();
+                console.log("Connected to BLE and subscribed to notifications.");
+                
+                // Initialize GPS tracking after successful BLE connection
+                startGPSWatcher(); 
+                
+            } catch (error) {
+                document.getElementById('connect-btn').textContent = "Connection Failed";
+                console.error("BLE Connection Error:", error);
+                alert("Connection failed. Ensure Bluetooth is ON and the ESP32 is advertising.");
+                updateDashboardStatus();
+            }
+        }
+
+        function handleNotifications(event) {
+            const value = event.target.value;
+            // The ESP32 sends a 4-byte Uint32 integer
+            const rawADC = new Uint32Array(value.buffer)[0]; 
+            
+            // Update the live data display
+            updateLiveDashboard(rawADC);
+            
+            // Update the raw value in the settings modal (for advanced users)
+            document.getElementById('live-raw-adc').textContent = rawADC;
+        }
+
+        // --- Initialization ---
+        window.onload = function() {
+            loadConfig();
+            updateSettingsForm(currentConfig.modelId || 'PULSAR150');
+            updateDashboardStatus();
+            
+            document.getElementById('connect-btn').addEventListener('click', connectBLE);
+            document.getElementById('save-config-btn').addEventListener('click', saveAndApplyCalibration);
+            document.getElementById('bike-select').addEventListener('change', handleModelChange);
+            document.getElementById('reset-trip-btn').addEventListener('click', resetTripTracking);
+            
+            // Load preset models into dropdown
+            const selector = document.getElementById('bike-select');
+            for (const id in BIKE_PRESETS) {
+                const option = document.createElement('option');
+                option.value = id;
+                option.textContent = BIKE_PRESETS[id].name;
+                selector.appendChild(option);
+            }
+
+            // Check for BLE support
+            if (typeof navigator.bluetooth === 'undefined') {
+                document.getElementById('connect-btn').textContent = "Bluetooth API Not Supported";
+                document.getElementById('connect-btn').disabled = true;
+            }
+        };
+
+    </script>
+
+    <!-- Main Mobile Container -->
+    <div class="max-w-md mx-auto p-4">
+        
+        <!-- Header & Status Icons -->
+        <header class="flex justify-between items-center bg-white p-4 rounded-xl shadow-lg mb-4">
+            <div>
+                <h1 class="text-lg font-bold">Fuel Monitor</h1>
+                <p id="bike-name" class="text-sm text-gray-500"></p>
+            </div>
+            <div class="flex space-x-2">
+                <div id="status-setup" class="w-4 h-4 rounded-full bg-red-500 shadow-sm transition"></div>
+                <div id="status-ble" class="w-4 h-4 rounded-full bg-red-500 shadow-sm transition"></div>
+                <div id="status-gps" class="w-4 h-4 rounded-full bg-red-500 shadow-sm transition"></div>
+                <button onclick="document.getElementById('settings-modal').classList.remove('hidden')" class="text-gray-500 hover:text-gray-900">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.942 3.313.805 2.551 2.454a1.724 1.724 0 000 3.031c.762 1.649-.915 3.391-2.551 2.454a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.942-3.313-.805-2.551-2.454a1.724 1.724 0 000-3.031c-.762-1.649.915-3.391 2.551-2.454a1.724 1.724 0 002.573-1.066zM12 14a2 2 0 100-4 2 2 0 000 4z" />
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- Connection Button -->
+        <button id="connect-btn" class="w-full py-3 bg-blue-600 text-white font-bold rounded-lg shadow-md hover:bg-blue-700 transition mb-4">
+            Connect BLE Device
+        </button>
+        
+        <!-- Dashboard Content (Disabled until connected) -->
+        <div id="full-dashboard-content" class="transition-opacity">
+
+            <!-- Fuel Gauge Display -->
+            <div class="bg-white p-5 rounded-xl shadow-lg mb-4">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xl font-semibold">Fuel Level</span>
+                    <span id="fuel-liters" class="text-2xl font-extrabold text-blue-600">0.00 L</span>
+                </div>
+                <div class="h-8 bg-gray-200 rounded-full overflow-hidden">
+                    <div id="fuel-gauge" class="h-full bg-red-500 rounded-full" style="width: 0%;"></div>
+                </div>
+                <p id="fuel-percent" class="text-center mt-2 text-lg font-medium text-gray-600">0.0% Remaining</p>
+            </div>
+
+            <!-- DTE & Mileage Cards -->
+            <div class="grid grid-cols-2 gap-4 mb-4">
+                <div class="bg-white p-4 rounded-xl shadow-lg">
+                    <p class="text-sm text-gray-500">Distance to Empty</p>
+                    <p id="dte-km" class="text-3xl font-extrabold text-indigo-600">0 km</p>
+                </div>
+                <div class="bg-white p-4 rounded-xl shadow-lg">
+                    <p class="text-sm text-gray-500">Live Mileage (AFE)</p>
+                    <p id="live-afe" class="text-3xl font-extrabold text-green-600">0.0 km/L</p>
+                </div>
+            </div>
+
+            <!-- Mileage Tracking Control -->
+            <div class="bg-white p-4 rounded-xl shadow-lg">
+                <h3 class="text-lg font-semibold mb-3 border-b pb-2">Trip Tracking</h3>
+                <div class="grid grid-cols-2 gap-4 text-center mb-3">
+                    <div>
+                        <p class="text-sm text-gray-500">Distance Covered</p>
+                        <p id="total-distance" class="font-bold">0.00 km</p>
+                    </div>
+                    <div>
+                        <p class="text-sm text-gray-500">Fuel Consumed</p>
+                        <p id="total-fuel-used" class="font-bold">0.00 L</p>
+                    </div>
+                </div>
+                <button id="reset-trip-btn" class="w-full py-2 bg-yellow-500 text-white font-bold rounded-lg hover:bg-yellow-600 transition">
+                    Reset Trip / Tank Fill
+                </button>
+                <p id="afg-status" class="text-center mt-2 text-sm text-gray-600">Tracking Live</p>
+                <p id="mileage-tip" class="text-xs italic text-center mt-2 p-1 bg-gray-100 rounded-lg">Waiting for initial data...</p>
+            </div>
+            
+            <!-- Future Feature Placeholder -->
+            <div class="mt-4 p-3 bg-indigo-100 border-l-4 border-indigo-500 rounded-lg shadow-inner">
+                <p class="text-sm font-semibold text-indigo-800">Future Feature:</p>
+                <p class="text-xs text-indigo-700">Map & Refuel Guidance will show here after subscription features are implemented!</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Low Fuel Notification Pop-up -->
+    <div id="notification-alert" class="notification fixed bottom-0 left-0 right-0 p-4 hidden">
+        <div class="bg-red-700 text-white p-4 rounded-lg shadow-2xl flex justify-between items-center">
+            <p id="notification-message" class="font-bold"></p>
+            <button onclick="document.getElementById('notification-alert').classList.add('hidden')" class="text-white opacity-70 hover:opacity-100">
+                &times;
+            </button>
+        </div>
+    </div>
+
+
+    <!-- Settings Modal (Always present, toggled hidden/visible) -->
+    <div id="settings-modal" class="modal-overlay fixed inset-0 flex items-center justify-center hidden">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-11/12 max-w-sm">
+            <h2 class="text-xl font-bold mb-4 border-b pb-2">Configuration & Calibration</h2>
+            
+            <label class="block mb-2 text-sm font-medium">Select Bike Variant:</label>
+            <select id="bike-select" class="w-full p-2 border border-gray-300 rounded-lg mb-4 bg-white">
+                <!-- Options populated by JS -->
+            </select>
+
+            <div id="custom-fields" class="space-y-3 p-3 bg-gray-100 rounded-lg">
+                <p class="text-md font-semibold text-gray-700">Project Calibration Mode</p>
+
+                <label class="block text-xs text-gray-600">Live ADC Reading:</label>
+                <p id="live-raw-adc" class="text-lg font-mono mb-2">0</p>
+                
+                <label class="block text-sm font-medium">Max Tank Capacity (L)</label>
+                <input id="capacity-input" type="number" step="0.1" class="w-full p-2 border border-gray-300 rounded-lg">
+
+                <label class="block text-sm font-medium">Initial Estimated Mileage (AFE - km/L)</label>
+                <input id="afe-input" type="number" step="0.1" class="w-full p-2 border border-gray-300 rounded-lg">
+
+                <label class="block text-sm font-medium">V_Max (Raw ADC when Tank is EMPTY)</label>
+                <input id="vmax-input" type="number" class="w-full p-2 border border-gray-300 rounded-lg">
+
+                <label class="block text-sm font-medium">V_Min (Raw ADC when Tank is FULL)</label>
+                <input id="vmin-input" type="number" class="w-full p-2 border border-gray-300 rounded-lg">
+            </div>
+
+            <button id="save-config-btn" class="w-full mt-6 py-2 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 transition">
+                Save & Apply Configuration
+            </button>
+        </div>
+    </div>
+
+</body>
+</html>
